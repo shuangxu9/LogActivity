@@ -1,0 +1,504 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using UnityEngine;
+using Script.Data.AL;
+
+/// <summary>
+/// 学生学习行为日志记录核心类
+/// 负责跟踪学习行为、计算时长并异步写入日志
+/// </summary>
+public class ExtractPlayerData : MonoBehaviour
+{
+    #region 单例
+    /// <summary>
+    /// 单例实例，提供全局访问点
+    /// </summary>
+    public static ExtractPlayerData Instance;
+    #endregion
+
+    #region 日志核心组件
+    /// <summary>
+    /// 待处理的日志实体类
+    /// 用于主线程和日志线程间的数据传递
+    /// </summary>
+    private class PendingLog
+    {
+        public int CourseId;
+        public int StudentNumber;
+        public string StudentName;
+        public DateTime ActivityTime;
+        public int Duration;
+        public string ActivityType;
+        public object Details;
+        public string Action;
+        public string CourseTitle;
+    }
+
+    /// <summary>
+    /// 日志队列，存储待写入数据库的日志
+    /// </summary>
+    private readonly Queue<PendingLog> logQueue = new Queue<PendingLog>();
+    /// <summary>
+    /// 日志队列的线程安全锁
+    /// </summary>
+    private readonly object logLock = new object();
+    /// <summary>
+    /// 日志线程的事件通知器
+    /// </summary>
+    private AutoResetEvent logEvent;
+    /// <summary>
+    /// 处理日志写入的后台线程
+    /// </summary>
+    private Thread logWorker;
+    /// <summary>
+    /// 日志线程的运行状态标记
+    /// </summary>
+    private volatile bool logWorkerRunning = false;
+    /// <summary>
+    /// 日志队列的最大容量
+    /// </summary>
+    private const int LOG_QUEUE_MAX = 1000;
+
+    /// <summary>
+    /// 数据库操作助手类实例
+    /// </summary>
+    private SQLHelper sqlHelper;
+    /// <summary>
+    /// 当前正在学习的课程ID，-1表示未进入任何课程
+    /// </summary>
+    public int currentCourseId = -1;
+    /// <summary>
+    /// 当前课程的标题
+    /// </summary>
+    private string currentCourseTitle;
+    /// <summary>
+    /// 最后一次活动的时间戳，用于计算行为持续时间
+    /// </summary>
+    private DateTime lastActivityTimestamp;
+    #endregion
+
+    #region 层级化日志跟踪状态
+    /// <summary>
+    /// 层级化学习路径状态（章-节-点-模型）
+    /// </summary>
+    private string currentChapter, currentSection, currentPoint, currentModel;
+    private DateTime chapterStart, sectionStart, pointStart, modelStart;
+    /// <summary>
+    /// 模块类型信息（如"模型"、"图片"）
+    /// </summary>
+    public string modType;
+
+    /// <summary>
+    /// 页面切换时间追踪（用于计算无效时长）
+    /// </summary>
+    private DateTime? panelLeaveTime;
+    public float invalidTime = 0f;  // 全局累计无效时间
+    public float overTime = 0f;     // 局部累计无效时间
+    #endregion
+
+    /// <summary>
+    /// 初始化单例和日志线程
+    /// </summary>
+    private void Awake()
+    {
+        // 单例实现
+        if (Instance == null)
+            Instance = this;
+        else
+            Destroy(gameObject);
+
+        // 初始化日志线程
+        logEvent = new AutoResetEvent(false);
+        logWorkerRunning = true;
+        logWorker = new Thread(LogWorkerLoop)
+        {
+            IsBackground = true,
+            Name = "StudentActivityLogWorker"
+        };
+        logWorker.Start();
+    }
+
+    /// <summary>
+    /// 初始化数据库连接
+    /// </summary>
+    void Start()
+    {
+        sqlHelper = new SQLHelper();
+    }
+
+    #region 课程级日志
+    /// <summary>
+    /// 处理进入课程的逻辑，初始化课程日志上下文
+    /// </summary>
+    /// <param name="courseId">课程ID</param>
+    public void EnterCourse(int courseId)
+    {
+        currentCourseId = courseId;
+        lastActivityTimestamp = DateTime.Now;
+
+        // 获取课程标题
+        try
+        {
+            Course course = sqlHelper.GetCourseById(courseId);
+            currentCourseTitle = course?.CourseTitle ?? $"CourseID: {courseId}";
+        }
+        catch
+        {
+            currentCourseTitle = $"CourseID: {courseId}";
+        }
+
+        // 记录进入课程日志
+        LogActivity("XR_Click", currentCourseTitle + "课程", "进入", 0);
+    }
+
+    /// <summary>
+    /// 处理退出课程的逻辑，结算课程学习时长
+    /// </summary>
+    /// <param name="courseId">课程ID</param>
+    public void ExitCourse(int courseId)
+    {
+        // 停止时长跟踪并结算
+        int duration = (int)(DateTime.Now - lastActivityTimestamp).TotalSeconds;
+        int effectiveDuration = duration - (int)invalidTime;
+        lastActivityTimestamp = DateTime.Now;
+
+        // 记录退出课程日志
+        var title = string.IsNullOrEmpty(currentCourseTitle) ? $"CourseID: {courseId}" : currentCourseTitle;
+        LogActivity("XR_Click", title + "课程", "退出", effectiveDuration);
+
+        // 重置课程相关状态
+        currentCourseId = -1;
+        currentCourseTitle = null;
+        invalidTime = 0f;
+    }
+    #endregion
+
+    #region 通用日志记录核心
+    /// <summary>
+    /// 记录学生行为日志到队列（线程安全）
+    /// </summary>
+    /// <param name="activityType">行为类型（如"XR_Click"）</param>
+    /// <param name="details">行为详情</param>
+    /// <param name="action">行为动作（如"进入"、"退出"）</param>
+    /// <param name="duration">行为持续时间（秒）</param>
+    private void LogActivity(string activityType, object details, string action, int duration)
+    {
+        if (currentCourseId == -1)
+        {
+            Debug.LogWarning("未进入课程，无法记录行为");
+            return;
+        }
+
+        // 捕获当前上下文快照（避免线程安全问题）
+        int courseIdSnapshot = currentCourseId;
+        int studentNumberSnapshot = Convert.ToInt32(UserSession.Instance.StudentNumber);
+        string studentNameSnapshot = $"{UserSession.Instance.FirstName}{UserSession.Instance.LastName}";
+        DateTime activityTime = DateTime.Now;
+        string courseTitleSnapshot = currentCourseTitle ?? $"CourseID: {courseIdSnapshot}";
+
+        // 创建日志对象并加入队列
+        var pendingLog = new PendingLog
+        {
+            CourseId = courseIdSnapshot,
+            StudentNumber = studentNumberSnapshot,
+            StudentName = studentNameSnapshot,
+            ActivityTime = activityTime,
+            Duration = duration,
+            ActivityType = activityType,
+            Details = details,
+            Action = action,
+            CourseTitle = courseTitleSnapshot
+        };
+
+        lock (logLock)
+        {
+            if (logQueue.Count >= LOG_QUEUE_MAX)
+            {
+                logQueue.Dequeue();
+                Debug.LogWarning("日志队列已满，移除最旧记录");
+            }
+            logQueue.Enqueue(pendingLog);
+        }
+        logEvent?.Set(); // 通知日志线程处理新日志
+    }
+    #endregion
+
+    #region 层级化行为日志（章-节-点-模型）
+    /// <summary>
+    /// 计算有效时长（扣除局部无效时间）
+    /// </summary>
+    private static int CalcDurationSeconds(DateTime start, DateTime? end = null)
+    {
+        if (start == default) return 0;
+        DateTime e = end ?? DateTime.Now;
+        int totalSecs = (int)(e - start).TotalSeconds;
+        int effectiveSecs = totalSecs - (int)Instance.overTime;
+        return Math.Max(effectiveSecs, 0);
+    }
+
+    /// <summary>
+    /// 进入个人页面（开始计算无效时间）
+    /// </summary>
+    public void EnterPersonalPanel()
+    {
+        panelLeaveTime = DateTime.Now;
+    }
+
+    /// <summary>
+    /// 回到课程页面（结算无效时间）
+    /// </summary>
+    public void ExitPersonalPanel()
+    {
+        if (panelLeaveTime.HasValue)
+        {
+            var leaveDuration = (DateTime.Now - panelLeaveTime.Value).TotalSeconds;
+            overTime += (float)leaveDuration;
+            invalidTime += overTime;
+            panelLeaveTime = null;
+        }
+    }
+
+    // 章节级日志
+    public void EnterChapter(string chapterName)
+    {
+        if (string.IsNullOrEmpty(chapterName) || currentChapter == chapterName) return;
+
+        // 退出下级节点并记录日志
+        ExitPoint();
+        ExitSection();
+
+        // 记录上一章节退出日志
+        if (!string.IsNullOrEmpty(currentChapter))
+        {
+            int duration = CalcDurationSeconds(chapterStart);
+            LogActivity("XR_Click", currentChapter, "退出章节", duration);
+        }
+
+        // 初始化新章节状态
+        currentChapter = chapterName;
+        chapterStart = DateTime.Now;
+        LogActivity("XR_Click", chapterName, "进入章节", 0);
+    }
+
+    public void ExitChapter()
+    {
+        if (string.IsNullOrEmpty(currentChapter)) return;
+
+        int duration = CalcDurationSeconds(chapterStart);
+        LogActivity("XR_Click", currentChapter, "退出章节", duration);
+        currentChapter = null;
+        overTime = 0f;
+    }
+
+    // 小节级日志
+    public void EnterSection(string sectionName)
+    {
+        if (string.IsNullOrEmpty(sectionName) || currentSection == sectionName) return;
+
+        // 退出下级节点并记录日志
+        ExitPoint();
+
+        // 记录上一小节退出日志
+        if (!string.IsNullOrEmpty(currentSection))
+        {
+            int duration = CalcDurationSeconds(sectionStart);
+            LogActivity("XR_Click", currentSection, "退出小节", duration);
+        }
+
+        // 初始化新小节状态
+        currentSection = sectionName;
+        sectionStart = DateTime.Now;
+        LogActivity("XR_Click", sectionName, "进入小节", 0);
+    }
+
+    public void ExitSection()
+    {
+        if (string.IsNullOrEmpty(currentSection)) return;
+
+        int duration = CalcDurationSeconds(sectionStart);
+        LogActivity("XR_Click", currentSection, "退出小节", duration);
+        currentSection = null;
+    }
+
+    // 小点级日志
+    public void EnterPoint(string pointName)
+    {
+        if (string.IsNullOrEmpty(pointName) || currentPoint == pointName) return;
+
+        // 记录上一小点退出日志
+        if (!string.IsNullOrEmpty(currentPoint))
+        {
+            int duration = CalcDurationSeconds(pointStart);
+            LogActivity("XR_Click", currentPoint, "退出小点", duration);
+        }
+
+        // 初始化新小点状态
+        currentPoint = pointName;
+        pointStart = DateTime.Now;
+        LogActivity("XR_Click", pointName, "进入小点", 0);
+    }
+
+    public void ExitPoint()
+    {
+        if (string.IsNullOrEmpty(currentPoint)) return;
+
+        int duration = CalcDurationSeconds(pointStart);
+        LogActivity("XR_Click", currentPoint, "退出小点", duration);
+        currentPoint = null;
+    }
+
+    // 模型级日志
+    public void EnterModel(string modelName, string type)
+    {
+        if (string.IsNullOrEmpty(modelName) || !string.IsNullOrEmpty(currentModel)) return;
+
+        currentModel = modelName;
+        modelStart = DateTime.Now;
+        LogActivity("XR_Click", modelName, "进入" + type, 0);
+    }
+
+    public void ExitModel(string type)
+    {
+        if (string.IsNullOrEmpty(currentModel)) return;
+
+        int duration = CalcDurationSeconds(modelStart);
+        LogActivity("XR_Click", currentModel, "退出" + type, duration);
+        currentModel = null;
+        modelStart = default;
+    }
+
+    /// <summary>
+    /// 结束所有层级的跟踪并记录日志
+    /// </summary>
+    public void EndHierarchyScopesIfAny()
+    {
+        ExitPoint();
+        ExitSection();
+        ExitChapter();
+        if (!string.IsNullOrEmpty(currentModel))
+            ExitModel(modType);
+    }
+    #endregion
+
+    #region 日志线程管理
+    /// <summary>
+    /// 日志工作线程主循环
+    /// 异步将队列中的日志写入数据库
+    /// </summary>
+    private void LogWorkerLoop()
+    {
+        while (logWorkerRunning)
+        {
+            try
+            {
+                PendingLog logItem = null;
+                lock (logLock)
+                {
+                    if (logQueue.Count > 0)
+                        logItem = logQueue.Dequeue();
+                }
+
+                if (logItem == null)
+                {
+                    logEvent.WaitOne(500); // 等待新日志或超时
+                    continue;
+                }
+
+                // 转换为数据库实体并写入
+                var activityLog = new StudentActiveLog(
+                    logItem.StudentNumber,
+                    logItem.StudentName,
+                    logItem.CourseId,
+                    logItem.ActivityTime,
+                    logItem.Duration,
+                    logItem.ActivityType,
+                    logItem.Details
+                );
+
+                try
+                {
+                    sqlHelper.AddStudentActivityLog(activityLog, logItem.Action, logItem.CourseTitle);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"日志写入失败: {ex.Message}");
+                }
+            }
+            catch (ThreadInterruptedException) { }
+            catch (Exception ex)
+            {
+                Debug.LogError($"日志线程异常: {ex.Message}");
+                Thread.Sleep(50);
+            }
+        }
+
+        // 线程停止前处理剩余日志
+        try
+        {
+            while (true)
+            {
+                PendingLog logItem = null;
+                lock (logLock)
+                {
+                    if (logQueue.Count > 0)
+                        logItem = logQueue.Dequeue();
+                    else
+                        break;
+                }
+
+                var activityLog = new StudentActiveLog(
+                    logItem.StudentNumber,
+                    logItem.StudentName,
+                    logItem.CourseId,
+                    logItem.ActivityTime,
+                    logItem.Duration,
+                    logItem.ActivityType,
+                    logItem.Details
+                );
+                try { sqlHelper.AddStudentActivityLog(activityLog, logItem.Action, logItem.CourseTitle); }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 尝试刷新日志队列并停止日志线程
+    /// </summary>
+    private void TryFlushAndStopLogWorker(int waitMillis)
+    {
+        if (logWorker == null) return;
+
+        logWorkerRunning = false;
+        logEvent?.Set();
+        if (!logWorker.Join(waitMillis))
+        {
+            try { logWorker.Interrupt(); }
+            catch { }
+        }
+
+        // 释放资源
+        logWorker = null;
+        logEvent?.Dispose();
+        logEvent = null;
+    }
+
+    /// <summary>
+    /// 应用退出时清理日志资源
+    /// </summary>
+    private void OnApplicationQuit()
+    {
+        EndHierarchyScopesIfAny();
+        TryFlushAndStopLogWorker(1500);
+    }
+
+    /// <summary>
+    /// 对象销毁时清理日志资源
+    /// </summary>
+    private void OnDestroy()
+    {
+        TryFlushAndStopLogWorker(1000);
+    }
+    #endregion
+}

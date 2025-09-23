@@ -1,0 +1,253 @@
+using UnityEngine;
+using System;
+using System.Threading.Tasks;
+using Script.Data.AL;
+
+/// <summary>
+/// 课程学习时长追踪器 (Singleton)
+/// 支持暂停/恢复计时，自动扣除暂停时间，直接根据实际时长判断是否记录
+/// </summary>
+public class CourseStudyTracker : MonoBehaviour
+{
+    public static CourseStudyTracker Instance { get; private set; }
+
+    private SQLHelper sqlHelper;
+
+    // 计时状态
+    private bool isTracking = false;          // 是否正在追踪
+    private bool isPaused = false;            // 是否处于暂停状态
+    private int? trackingCourseId = null;     // 当前追踪的课程ID
+    private int? trackingStudentNumber = null;// 当前学生学号
+    private DateTime startTime;               // 开始/恢复计时的时间
+    private TimeSpan accumulatedDuration;     // 累计有效学习时长（扣除暂停时间）
+    private DateTime originalStartTime;//课程首次进入的开始时间
+
+    private void Awake()
+    {
+        if (Instance == null)
+        {
+            Instance = this;
+            sqlHelper = new SQLHelper();
+           
+        }
+        else
+        {
+            Destroy(gameObject);
+        }
+    }
+
+    /// <summary>
+    /// 开始或恢复课程计时
+    /// </summary>
+    public async Task StartOrResumeTracking(int courseId)
+    {
+        // 若正在追踪同一课程且处于暂停状态，直接恢复计时
+        if (isTracking && trackingCourseId.HasValue && trackingCourseId.Value == courseId && isPaused)
+        {
+            isPaused = false;
+            startTime = DateTime.Now; // 记录恢复时间，用于计算后续片段
+            Debug.Log($"恢复追踪课程 {courseId}，已累计学习 {accumulatedDuration.TotalSeconds} 秒");
+            return;
+        }
+
+        // 若正在追踪不同课程，先上传旧记录
+        if (isTracking && trackingCourseId.HasValue && trackingCourseId.Value != courseId)
+        {
+            Debug.LogWarning($"正在追踪课程 {trackingCourseId}，先停止并上传旧记录");
+            try
+            {
+                await StopTrackingAndUpload();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"停止旧课程追踪失败: {ex.Message}");
+                ResetTrackingState();
+            }
+        }
+
+        // 验证用户会话
+        if (UserSession.Instance == null)
+        {
+            Debug.LogError("UserSession为空，无法开始追踪");
+            return;
+        }
+
+        // 解析学生学号
+        try
+        {
+            trackingStudentNumber = Convert.ToInt32(UserSession.Instance.StudentNumber);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"解析学号失败: {ex.Message}");
+            trackingStudentNumber = null;
+            return;
+        }
+
+        // 初始化新课程追踪
+        trackingCourseId = courseId;
+        startTime = DateTime.Now;
+        originalStartTime = startTime;
+        accumulatedDuration = TimeSpan.Zero; // 重置累计时长
+        isTracking = true;
+        isPaused = false;
+
+        Debug.Log($"开始追踪课程 {courseId}，开始时间 {startTime:O}");
+    }
+
+    /// <summary>
+    /// 暂停课程计时（进入个人页等场景调用）
+    /// </summary>
+    public void PauseTracking()
+    {
+        if (isTracking && !isPaused)
+        {
+            isPaused = true;
+            // 累加当前片段时长（从开始/恢复到暂停的时间）
+            accumulatedDuration += DateTime.Now - startTime;
+            Debug.Log($"暂停追踪课程 {trackingCourseId}，累计已学习 {accumulatedDuration.TotalSeconds} 秒");
+        }
+    }
+
+    /// <summary>
+    /// 停止计时并上传记录
+    /// </summary>
+    public async Task StopTrackingAndUpload()
+    {
+        if (!isTracking || !trackingCourseId.HasValue || !trackingStudentNumber.HasValue)
+        {
+            Debug.LogWarning("未在追踪状态，无需停止");
+            return;
+        }
+
+        using (var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(10)))
+        {
+            try
+            {
+                await StopTrackingAndUploadInternal(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Debug.LogWarning("上传超时，强制重置状态");
+                ResetTrackingState();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"停止追踪异常: {ex.Message}");
+                ResetTrackingState();
+            }
+        }
+    }
+
+    private async Task StopTrackingAndUploadInternal(System.Threading.CancellationToken cancellationToken)
+    {
+        // 捕获当前状态（避免后续重置影响）
+        int courseId = trackingCourseId.Value;
+        int studentNumber = trackingStudentNumber.Value;
+       // DateTime sessionStartTime = startTime; // 记录本次会话开始时间
+
+        // 计算总有效时长（累计时长 + 最后一段未暂停的时间）
+        TimeSpan totalDuration = accumulatedDuration;
+        if (!isPaused)
+        {
+            totalDuration += DateTime.Now - startTime;
+        }
+        int durationSeconds = (int)totalDuration.TotalSeconds;
+
+        // 重置追踪状态（无论是否上传成功，都终止当前追踪）
+        ResetTrackingState();
+
+        // 直接根据时长判断是否记录（去掉isGnoreTime依赖）
+        if (durationSeconds < 10)
+        {
+            Debug.Log($"课程 {courseId} 学习时长 {durationSeconds} 秒（不足10秒），忽略记录");
+            return;
+        }
+
+        // 构建学习记录
+        string studentName = $"{UserSession.Instance?.FirstName ?? ""}{UserSession.Instance?.LastName ?? ""}";
+        var studyRecord = new StudentStudyDuration(
+            student_Number: studentNumber,
+            student_Name: studentName,
+            course_Id: courseId,
+            study_Duration: durationSeconds,
+            start_Study_Time: originalStartTime,
+            end_Study_Time: DateTime.Now,
+            invalid_duration: (int)ExtractPlayerData.Instance.invalidTime
+        ) ;
+
+        Debug.Log($"课程 {courseId} 学习结束，总有效时长 {durationSeconds} 秒，开始上传...");
+
+        // 异步上传数据
+        bool success = false;
+        try
+        {
+            success = await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // 保存明细
+                if (!sqlHelper.AddStudentStudyDuration(studyRecord))
+                    return false;
+
+                cancellationToken.ThrowIfCancellationRequested();
+                // 更新学生课程总时长
+                sqlHelper.UpdateStudentStudySummaryFromDetails(studentNumber, studentName, courseId);
+
+                cancellationToken.ThrowIfCancellationRequested();
+                // 更新课程全局总时长
+                sqlHelper.UpdateCourseTotalStudyDuration(courseId);
+
+                return true;
+            }, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            Debug.LogWarning($"课程 {courseId} 上传被取消（超时）");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"课程 {courseId} 上传失败: {ex.Message}");
+            success = false;
+        }
+
+        if (success)
+        {
+            Debug.Log($"课程 {courseId} 学习记录上传成功");
+        }
+        else
+        {
+            Debug.LogError($"课程 {courseId} 学习记录上传失败");
+        }
+    }
+
+    /// <summary>
+    /// 重置所有追踪状态
+    /// </summary>
+    private void ResetTrackingState()
+    {
+        isTracking = false;
+        isPaused = false;
+        trackingCourseId = null;
+        trackingStudentNumber = null;
+        accumulatedDuration = TimeSpan.Zero;
+    }
+
+    private void OnApplicationQuit()
+    {
+        if (isTracking && trackingCourseId.HasValue && trackingStudentNumber.HasValue)
+        {
+            try
+            {
+                // 非阻塞上传，确保应用退出前触发
+                _ = StopTrackingAndUpload();
+                Debug.Log("应用退出，触发最后一次学习记录保存");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("应用退出时保存失败: " + ex.Message);
+            }
+        }
+    }
+}
